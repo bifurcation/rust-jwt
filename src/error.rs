@@ -27,6 +27,9 @@ pub enum Error {
     Utf8(FromUtf8Error),
     #[cfg(feature = "openssl")]
     OpenSsl(openssl::error::ErrorStack),
+
+    NoIssuerJwt,
+    InvalidKeyBinding,
 }
 
 impl fmt::Display for Error {
@@ -50,6 +53,9 @@ impl fmt::Display for Error {
             RustCryptoMacKeyLength(ref x) => write!(f, "{}", x),
             #[cfg(feature = "openssl")]
             OpenSsl(ref x) => write!(f, "{}", x),
+
+            NoIssuerJwt => write!(f, "No issuer JWT"),
+            InvalidKeyBinding => write!(f, "Invalid key binding JWT"),
         }
     }
 }

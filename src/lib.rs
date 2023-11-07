@@ -114,6 +114,7 @@ pub mod algorithm;
 pub mod claims;
 pub mod error;
 pub mod header;
+pub mod sd;
 pub mod token;
 
 const SEPARATOR: &str = ".";
