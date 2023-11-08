@@ -28,8 +28,11 @@ pub enum Error {
     #[cfg(feature = "openssl")]
     OpenSsl(openssl::error::ErrorStack),
 
+    InvalidPointer,
+    InvalidClaims,
     NoIssuerJwt,
     InvalidKeyBinding,
+    InvalidDisclosure,
 }
 
 impl fmt::Display for Error {
@@ -54,8 +57,11 @@ impl fmt::Display for Error {
             #[cfg(feature = "openssl")]
             OpenSsl(ref x) => write!(f, "{}", x),
 
+            InvalidPointer => write!(f, "Invalid JSON pointer"),
+            InvalidClaims => write!(f, "Invalid claims"),
             NoIssuerJwt => write!(f, "No issuer JWT"),
             InvalidKeyBinding => write!(f, "Invalid key binding JWT"),
+            InvalidDisclosure => write!(f, "Invalid disclosure object"),
         }
     }
 }

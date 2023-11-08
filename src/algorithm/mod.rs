@@ -10,6 +10,7 @@
 //! let hs256_key: Hmac<Sha256> = Hmac::new_from_slice(b"some-secret").unwrap();
 //! ```
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
@@ -46,6 +47,20 @@ impl Default for AlgorithmType {
     }
 }
 
+/// The type of a hash algorithm, according to the [IANA
+/// Registry](https://www.iana.org/assignments/named-information/named-information.xhtml)
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HashAlgorithmType {
+    #[serde(rename = "sha-256")]
+    Sha256,
+
+    #[serde(rename = "sha-384")]
+    Sha384,
+
+    #[serde(rename = "sha-512")]
+    Sha512,
+}
+
 /// An algorithm capable of signing base64 encoded header and claims strings.
 /// strings.
 pub trait SigningAlgorithm {
@@ -64,6 +79,21 @@ pub trait VerifyingAlgorithm {
         let signature_bytes = base64::decode_config(signature, base64::URL_SAFE_NO_PAD)?;
         self.verify_bytes(header, claims, &*signature_bytes)
     }
+}
+
+/// A hash algorithm
+pub trait HashAlgorithm {
+    fn hash_algorithm_type(&self) -> HashAlgorithmType;
+
+    fn hash(&self, data: impl AsRef<[u8]>) -> String;
+}
+
+/// Generate random data
+pub(crate) fn random_data(len: usize) -> Vec<u8> {
+    let mut vec = vec![0; len];
+    let mut rng = rand::thread_rng();
+    rng.fill(vec.as_mut_slice());
+    vec
 }
 
 // TODO: investigate if these AsRef impls are necessary
