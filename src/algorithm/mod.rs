@@ -12,6 +12,7 @@
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::Error;
 
@@ -61,6 +62,40 @@ pub enum HashAlgorithmType {
     Sha512,
 }
 
+/// Mechanisms for associating a proof-of-possession key with a JWT
+#[derive(PartialEq, Serialize, Deserialize)]
+pub enum KeyConfirmation {
+    #[serde(rename = "jwk")]
+    Jwk(Value),
+
+    #[serde(rename = "jkt")]
+    JwkThumbprint(String),
+}
+
+impl KeyConfirmation {
+    pub fn matches(&self, key: &impl KeyConfirmationAlgorithm) -> bool {
+        match self {
+            KeyConfirmation::Jwk(_) => *self == key.jwk_confirmation(),
+            KeyConfirmation::JwkThumbprint(_) => *self == key.jwk_thumbprint_confirmation(),
+        }
+    }
+}
+
+/// An algorithm capable of being used as a ProofOfPossession JWT
+pub trait KeyConfirmationAlgorithm {
+    fn as_jwk(&self) -> Value;
+
+    fn thumbprint(&self) -> String;
+
+    fn jwk_confirmation(&self) -> KeyConfirmation {
+        KeyConfirmation::Jwk(self.as_jwk())
+    }
+
+    fn jwk_thumbprint_confirmation(&self) -> KeyConfirmation {
+        KeyConfirmation::JwkThumbprint(self.thumbprint())
+    }
+}
+
 /// An algorithm capable of signing base64 encoded header and claims strings.
 /// strings.
 pub trait SigningAlgorithm {
@@ -89,11 +124,11 @@ pub trait HashAlgorithm {
 }
 
 /// Generate random data
-pub(crate) fn random_data(len: usize) -> Vec<u8> {
+pub(crate) fn random_data(len: usize) -> String {
     let mut vec = vec![0; len];
     let mut rng = rand::thread_rng();
     rng.fill(vec.as_mut_slice());
-    vec
+    base64::encode_config(vec, base64::URL_SAFE_NO_PAD)
 }
 
 // TODO: investigate if these AsRef impls are necessary

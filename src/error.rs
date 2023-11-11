@@ -33,6 +33,8 @@ pub enum Error {
     NoIssuerJwt,
     InvalidKeyBinding,
     InvalidDisclosure,
+    InvalidPresentation,
+    InvalidConfirmationKey,
 }
 
 impl fmt::Display for Error {
@@ -62,6 +64,8 @@ impl fmt::Display for Error {
             NoIssuerJwt => write!(f, "No issuer JWT"),
             InvalidKeyBinding => write!(f, "Invalid key binding JWT"),
             InvalidDisclosure => write!(f, "Invalid disclosure object"),
+            InvalidPresentation => write!(f, "Invalid presentation"),
+            InvalidConfirmationKey => write!(f, "Invalid confirmation key"),
         }
     }
 }

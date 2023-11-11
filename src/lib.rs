@@ -127,6 +127,21 @@ pub struct Token<H, C, S> {
     signature: S,
 }
 
+impl<H, C, S> Clone for Token<H, C, S>
+where
+    H: Clone,
+    C: Clone,
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            claims: self.claims.clone(),
+            signature: self.signature.clone(),
+        }
+    }
+}
+
 impl<H, C, S> Token<H, C, S> {
     pub fn header(&self) -> &H {
         &self.header

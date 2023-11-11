@@ -1,8 +1,9 @@
 use crate::algorithm::{
-    random_data, HashAlgorithm, HashAlgorithmType, SigningAlgorithm, VerifyingAlgorithm,
+    random_data, HashAlgorithm, HashAlgorithmType, KeyConfirmation, KeyConfirmationAlgorithm,
+    SigningAlgorithm, VerifyingAlgorithm,
 };
 use crate::error::Error;
-use crate::header::JoseHeader;
+use crate::header::{Header, HeaderType, JoseHeader};
 use crate::token::signed::SignWithKey;
 use crate::token::verified::VerifyWithKey;
 use crate::token::{Signed, Unsigned, Unverified, Verified};
@@ -11,11 +12,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::marker::PhantomData;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SALT_SIZE: usize = 16;
+const NONCE_SIZE: usize = 16;
 const SEPARATOR: &str = "~";
-const REDACTION_FIELD: &str = "...";
 const REDACTION_LIST_FIELD: &str = "_sd";
+const CONFIRMATION_KEY_FIELD: &str = "cnf";
 const REDACTION_ALG_FIELD: &str = "_sd_alg";
 
 #[derive(Serialize, Deserialize)]
@@ -24,7 +27,7 @@ struct Redaction {
     hash: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Disclosure {
     key: Option<String>,
     value: Value,
@@ -36,9 +39,8 @@ impl Disclosure {
         let mut parts: Vec<Value> = Vec::with_capacity(3);
 
         let salt = random_data(SALT_SIZE);
-        let salt_base64 = base64::encode_config(salt.clone(), base64::URL_SAFE_NO_PAD);
 
-        parts.push(salt_base64.into());
+        parts.push(salt.into());
         key.as_ref().map(|k| parts.push(k.clone().into()));
         parts.push(value.clone());
 
@@ -99,6 +101,12 @@ impl FromBase64 for Disclosure {
 
 trait Redactable {
     fn find_container<'a>(&'a mut self, hash: String) -> Option<&'a mut Value>;
+    fn find_sd_hash(
+        &self,
+        _pointer: &str,
+        sd_alg: &impl HashAlgorithm,
+        disclosures: &[Disclosure],
+    ) -> Option<usize>;
     fn redact(&mut self, pointer: &str, sd_alg: &impl HashAlgorithm) -> Result<Disclosure, Error>;
     fn unredact(
         &mut self,
@@ -153,6 +161,41 @@ impl Redactable for Value {
         }
 
         None
+    }
+
+    fn find_sd_hash(
+        &self,
+        pointer: &str,
+        sd_alg: &impl HashAlgorithm,
+        disclosures: &[Disclosure],
+    ) -> Option<usize> {
+        let cut = pointer.rfind("/")?;
+        let (container_ptr, elem_ptr) = pointer.split_at(cut);
+
+        let container = self.pointer(container_ptr)?;
+        match container {
+            Value::Array(_) => {
+                let value = container.pointer(elem_ptr)?;
+                let redaction: Redaction = serde_json::from_value(value.clone()).ok()?;
+                let hash = redaction.hash;
+                disclosures.iter().position(|d| d.hash(sd_alg) == hash)
+            }
+            Value::Object(map) => {
+                let sd = map.get(REDACTION_LIST_FIELD)?;
+                let sd_array: Vec<_> = sd.as_array()?.iter().map(|d| d.as_str()).collect();
+
+                let key: String = elem_ptr[1..].into();
+                disclosures.iter().position(|d| {
+                    if d.key != Some(key.clone()) {
+                        return false;
+                    }
+
+                    let hash = d.hash(sd_alg);
+                    sd_array.contains(&Some(&hash))
+                })
+            }
+            _ => return None,
+        }
     }
 
     fn redact(&mut self, pointer: &str, sd_alg: &impl HashAlgorithm) -> Result<Disclosure, Error> {
@@ -242,19 +285,6 @@ impl Redactable for Value {
     }
 }
 
-trait OptionallyRedacted {
-    fn is_redacted(&self) -> bool;
-}
-
-impl OptionallyRedacted for Value {
-    fn is_redacted(&self) -> bool {
-        match self {
-            Value::Object(map) => map.get(REDACTION_FIELD).is_some() && map.len() == 1,
-            _ => false,
-        }
-    }
-}
-
 /// A type that allows array entries to be marked as optionally redacted.  Only supports
 /// optionality on deserialization, not serialization, since serializing requires that you know the
 /// proper hash value for the redaction.
@@ -266,7 +296,7 @@ type IssuerJwt<H, S> = crate::Token<H, Value, S>;
 #[derive(Serialize, Deserialize)]
 struct StandardClaims {
     _sd_alg: HashAlgorithmType,
-    // TODO: "cnf"
+    cnf: Option<KeyConfirmation>,
 }
 
 /// Representation of a structured JWT. Methods vary based on the signature
@@ -290,6 +320,33 @@ impl<H, C, S> Token<H, C, S> {
             disclosures: self.disclosures,
             sd_alg: self.sd_alg,
             signature: Unsigned,
+            _phantom: Default::default(),
+        }
+    }
+
+    fn matches_confirmation_key(&self, key: &impl KeyConfirmationAlgorithm) -> Result<(), Error> {
+        let raw_claims = self.issuer_jwt.claims().clone();
+        let claims: StandardClaims =
+            serde_json::from_value(raw_claims).map_err(|e| Error::Json(e))?;
+        let cnf = claims.cnf.ok_or(Error::InvalidConfirmationKey)?;
+        cnf.matches(key)
+            .then(|| ())
+            .ok_or(Error::InvalidConfirmationKey)
+    }
+}
+
+impl<H, C, S> Clone for Token<H, C, S>
+where
+    H: Clone,
+    C: Clone,
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            issuer_jwt: self.issuer_jwt.clone(),
+            disclosures: self.disclosures.clone(),
+            sd_alg: self.sd_alg.clone(),
+            signature: self.signature.clone(),
             _phantom: Default::default(),
         }
     }
@@ -326,6 +383,13 @@ impl<H, C: Serialize> Token<H, C, Unsigned> {
         self.disclosures.push(disclosure);
         Ok(())
     }
+
+    pub fn set_confirmation_key(&mut self, cnf: KeyConfirmation) -> Result<(), Error> {
+        let claims = self.issuer_jwt.claims_mut().as_object_mut().unwrap();
+        let cnf_value = serde_json::to_value(cnf).map_err(|e| Error::Json(e))?;
+        claims.insert(CONFIRMATION_KEY_FIELD.into(), cnf_value);
+        Ok(())
+    }
 }
 
 impl<H, C> SignWithKey<Token<H, C, Signed>> for Token<H, C, Unsigned>
@@ -335,7 +399,94 @@ where
 {
     fn sign_with_key(self, key: &impl SigningAlgorithm) -> Result<Token<H, C, Signed>, Error> {
         let issuer_jwt = self.issuer_jwt.sign_with_key(key)?;
+        let mut token = Token {
+            issuer_jwt: issuer_jwt,
+            disclosures: self.disclosures,
+            sd_alg: self.sd_alg,
+            signature: Signed {
+                token_string: Default::default(),
+            },
+            _phantom: Default::default(),
+        };
 
+        token.reserialize()?;
+        Ok(token)
+    }
+}
+
+impl<H, C> Token<H, C, Signed> {
+    /// Get the string representation of the token.
+    pub fn as_str(&self) -> &str {
+        &self.signature.token_string
+    }
+
+    /// Remove the selective disclosure for the element at the given JSON pointer
+    fn forget(&mut self, pointer: &str) -> Result<(), Error> {
+        let to_delete = self
+            .issuer_jwt
+            .claims()
+            .find_sd_hash(pointer, &self.sd_alg, &self.disclosures)
+            .ok_or(Error::InvalidPointer)?;
+
+        self.disclosures.remove(to_delete);
+        self.reserialize()
+    }
+
+    /// Remove all selective disclosures
+    fn forget_all(&mut self) -> Result<(), Error> {
+        self.disclosures.clear();
+        self.reserialize()
+    }
+}
+
+impl<H, C> Token<H, C, Signed>
+where
+    H: FromBase64,
+    C: FromBase64,
+{
+    /// Get a view of this token as unverified, so that it can be verified again
+    pub fn as_unverified(&self) -> Result<Token<H, C, Unverified>, Error> {
+        let signature = Unverified {
+            header_str: &"",
+            claims_str: &"",
+            signature_str: &"",
+        };
+
+        Ok(Token {
+            issuer_jwt: self.issuer_jwt.as_unverified()?,
+            disclosures: self.disclosures.clone(),
+            sd_alg: self.sd_alg.clone(),
+            signature,
+            _phantom: Default::default(),
+        })
+    }
+}
+
+impl<H, C> From<Token<H, C, Signed>> for String {
+    fn from(token: Token<H, C, Signed>) -> Self {
+        token.signature.token_string
+    }
+}
+
+impl<'a, H, C> From<Token<H, C, Unverified<'a>>> for Token<H, C, Signed> {
+    fn from(token: Token<H, C, Unverified<'a>>) -> Self {
+        let mut token = Token {
+            issuer_jwt: token.issuer_jwt.into(),
+            disclosures: token.disclosures,
+            sd_alg: token.sd_alg,
+            signature: Signed {
+                token_string: Default::default(),
+            },
+            _phantom: Default::default(),
+        };
+
+        token.reserialize().unwrap();
+        token
+    }
+}
+
+impl<H, C> Token<H, C, Signed> {
+    fn reserialize(&mut self) -> Result<(), Error> {
         let disclosures = self
             .disclosures
             .iter()
@@ -343,30 +494,11 @@ where
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut parts = disclosures;
-        parts.insert(0, issuer_jwt.as_str().into()); // issuer JWT comes first
+        parts.insert(0, self.issuer_jwt.as_str().into()); // issuer JWT comes first
         parts.push("".into()); // empty key binding comes last
 
-        let token_string = parts.join(SEPARATOR);
-        Ok(Token {
-            issuer_jwt: issuer_jwt,
-            disclosures: self.disclosures,
-            sd_alg: self.sd_alg,
-            signature: Signed { token_string },
-            _phantom: Default::default(),
-        })
-    }
-}
-
-impl<'a, H, C> Token<H, C, Signed> {
-    /// Get the string representation of the token.
-    pub fn as_str(&self) -> &str {
-        &self.signature.token_string
-    }
-}
-
-impl<H, C> From<Token<H, C, Signed>> for String {
-    fn from(token: Token<H, C, Signed>) -> Self {
-        token.signature.token_string
+        self.signature.token_string = parts.join(SEPARATOR);
+        Ok(())
     }
 }
 
@@ -380,6 +512,7 @@ impl<'a, H: FromBase64, C: FromBase64> Token<H, C, Unverified<'a>> {
         let last_entry = raw_disclosures.last();
         if last_entry.is_none() || last_entry.unwrap() != "" {
             // XXX(RLB): It seems like Option should have a more elegant flavor of the above
+            println!("No last entry");
             return Err(Error::InvalidKeyBinding);
         }
         raw_disclosures.pop();
@@ -437,20 +570,232 @@ impl<H, C: for<'de> Deserialize<'de> + Sized> Token<H, C, Verified> {
     }
 }
 
+fn key_binding_header(key: &impl SigningAlgorithm) -> Header {
+    Header {
+        algorithm: key.algorithm_type(),
+        key_id: None,
+        type_: Some(HeaderType::KeyBindingJwt),
+        content_type: None,
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct KeyBindingClaims {
+    iat: u64,
+    aud: String,
+    nonce: String,
+    _sd_hash: String, // XXX-SPEC: The underscore seems unnecessary
+}
+
+type KeyBindingJwt<S> = crate::Token<Header, KeyBindingClaims, S>;
+
+pub struct Presentation<H, C, S> {
+    token: Token<H, C, Signed>,
+    kb_jwt: KeyBindingJwt<S>,
+    signature: S,
+}
+
+impl<H, C> Presentation<H, C, Unsigned> {
+    pub fn new(token: Token<H, C, Signed>, aud: String) -> Self {
+        let mut presentation = Self {
+            token: token,
+            kb_jwt: Default::default(),
+            signature: Unsigned,
+        };
+
+        let claims = presentation.kb_jwt.claims_mut();
+        claims.aud = aud;
+
+        presentation
+    }
+}
+
+// XXX(RLB) This is a hack around not being able to include multiple types in an `impl` parameter
+// declaration.
+pub trait KeyConfirmationAndSigningAlgorithm: SigningAlgorithm + KeyConfirmationAlgorithm {}
+
+impl<T> KeyConfirmationAndSigningAlgorithm for T where T: SigningAlgorithm + KeyConfirmationAlgorithm
+{}
+
+// XXX(RLB) This is a hack around not being able to include multiple types in an `impl` parameter
+// declaration.
+pub trait KeyConfirmationAndVerifyingAlgorithm:
+    VerifyingAlgorithm + KeyConfirmationAlgorithm
+{
+}
+
+impl<T> KeyConfirmationAndVerifyingAlgorithm for T where
+    T: VerifyingAlgorithm + KeyConfirmationAlgorithm
+{
+}
+
+impl<H, C> Presentation<H, C, Unsigned> {
+    pub fn sign_with_key(
+        self,
+        key: &impl KeyConfirmationAndSigningAlgorithm,
+    ) -> Result<Presentation<H, C, Signed>, Error> {
+        // Verify that the key matches the issuer JWT
+        let sd_alg = self.token.sd_alg;
+        let token_str = self.token.as_str();
+        self.token.matches_confirmation_key(key)?;
+
+        // Set up and sign the Key Binding JWT
+        let mut kb_jwt = self.kb_jwt;
+
+        let header = kb_jwt.header_mut();
+        *header = key_binding_header(key);
+
+        let claims = kb_jwt.claims_mut();
+        claims.iat = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        claims.nonce = random_data(NONCE_SIZE);
+        claims._sd_hash = sd_alg.hash(&token_str);
+
+        let kb_jwt = kb_jwt.sign_with_key(key)?;
+
+        // Assemble the token string
+        let token_string = self.token.signature.token_string.clone() + kb_jwt.as_str();
+
+        Ok(Presentation {
+            token: self.token,
+            kb_jwt: kb_jwt,
+            signature: Signed { token_string },
+        })
+    }
+
+    /// Remove the selective disclosure for the element at the given JSON pointer
+    pub fn forget(&mut self, pointer: &str) -> Result<(), Error> {
+        self.token.forget(pointer)
+    }
+
+    /// Remove all selective disclosures
+    pub fn forget_all(&mut self) -> Result<(), Error> {
+        self.token.forget_all()
+    }
+}
+
+impl<H, C> Presentation<H, C, Signed> {
+    /// Get the string representation of the presentation.
+    pub fn as_str(&self) -> &str {
+        &self.signature.token_string
+    }
+}
+
+impl<H, C> From<Presentation<H, C, Signed>> for String {
+    fn from(presentation: Presentation<H, C, Signed>) -> Self {
+        presentation.signature.token_string
+    }
+}
+
+impl<'a, H: FromBase64, C: FromBase64> Presentation<H, C, Unverified<'a>> {
+    /// Not recommended. Parse the header and claims without checking the validity of the signature.
+    pub fn parse_unverified(
+        presentation_str: &'a str,
+    ) -> Result<Presentation<H, C, Unverified>, Error> {
+        let cut = presentation_str
+            .rfind("~")
+            .ok_or(Error::InvalidPresentation)?;
+        if cut == presentation_str.len() - 1 {
+            return Err(Error::InvalidPresentation);
+        }
+        let (token_str, kb_jwt_str) = presentation_str.split_at(cut + 1);
+
+        let token: Token<H, C, _> = Token::parse_unverified(token_str)?;
+        let token: Token<H, C, Signed> = token.into();
+        let kb_jwt: KeyBindingJwt<Unverified<'a>> = crate::Token::parse_unverified(kb_jwt_str)?;
+        let signature = Unverified {
+            header_str: &"",
+            claims_str: &"",
+            signature_str: &"",
+        };
+
+        Ok(Self {
+            token,
+            kb_jwt,
+            signature,
+        })
+    }
+}
+
+impl<'a, H, C> Presentation<H, C, Unverified<'a>> {
+    pub fn verify_with_key(
+        self,
+        key: &impl KeyConfirmationAndVerifyingAlgorithm,
+    ) -> Result<Presentation<H, C, Verified>, Error> {
+        // Verify that the key matches the issuer JWT
+        let sd_alg = self.token.sd_alg;
+        let token_str = self.token.as_str();
+        self.token.matches_confirmation_key(key)?;
+
+        // Verify the KB JWT
+        let kb_jwt = self.kb_jwt.verify_with_key(key)?;
+
+        // Verify that the SD corresponds to the issuer JWT
+        let sd_hash = sd_alg.hash(&token_str);
+        let claims = kb_jwt.claims();
+        if sd_hash != claims._sd_hash {
+            println!("Invalid SD hash match {} != {}", sd_hash, claims._sd_hash);
+            return Err(Error::InvalidKeyBinding);
+        }
+
+        Ok(Presentation {
+            token: self.token,
+            kb_jwt,
+            signature: Verified,
+        })
+    }
+}
+
+impl<H: FromBase64, C: FromBase64> Presentation<H, C, Verified> {
+    pub fn token(self) -> Token<H, C, Signed> {
+        self.token
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::algorithm::AlgorithmType;
-    use crate::algorithm::HashAlgorithmType;
+    use crate::algorithm::{
+        openssl::PKeyWithDigest, AlgorithmType, HashAlgorithmType, KeyConfirmationAlgorithm,
+        SigningAlgorithm,
+    };
     use crate::error::Error;
     use crate::header::Header;
-    use crate::sd::{Redactable, Token, REDACTION_FIELD, REDACTION_LIST_FIELD};
+    use crate::sd::{Presentation, Redactable, Token, REDACTION_LIST_FIELD};
     use crate::token::signed::SignWithKey;
     use crate::token::verified::VerifyWithKey;
     use crate::Claims;
     use hmac::Hmac;
     use hmac::Mac;
+    use openssl::pkey::{Private, Public};
     use serde_json::{json, Value};
     use sha2::Sha256;
+
+    fn generate_key_pair() -> (PKeyWithDigest<Private>, PKeyWithDigest<Public>) {
+        use openssl::{
+            ec::{EcGroup, EcKey},
+            hash::MessageDigest,
+            nid::Nid,
+            pkey::PKey,
+        };
+
+        let p256 = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let ec_issuer_priv = EcKey::generate(&p256).unwrap();
+        let pub_pt = ec_issuer_priv.public_key();
+        let ec_issuer_pub = EcKey::from_public_key(&p256, &pub_pt).unwrap();
+
+        let issuer_priv = PKeyWithDigest {
+            digest: MessageDigest::sha256(),
+            key: PKey::from_ec_key(ec_issuer_priv).unwrap(),
+        };
+        let issuer_pub = PKeyWithDigest {
+            digest: MessageDigest::sha256(),
+            key: PKey::from_ec_key(ec_issuer_pub).unwrap(),
+        };
+
+        (issuer_priv, issuer_pub)
+    }
 
     #[test]
     pub fn raw_data_no_disclosures() -> Result<(), Error> {
@@ -468,11 +813,17 @@ mod tests {
 
     #[test]
     pub fn roundtrip_no_disclosures() -> Result<(), Error> {
+        let (issuer_priv, issuer_pub) = generate_key_pair();
         let sd_alg = HashAlgorithmType::Sha256;
-        let token: Token<Header, Claims, _> =
-            Token::new(Default::default(), Default::default(), sd_alg)?;
-        let key: Hmac<Sha256> = Hmac::new_from_slice(b"secret")?;
-        let signed_token = token.sign_with_key(&key)?;
+        let header = Header {
+            algorithm: issuer_priv.algorithm_type(),
+            key_id: None,
+            type_: None,
+            content_type: None,
+        };
+
+        let token: Token<Header, Claims, _> = Token::new(header, Default::default(), sd_alg)?;
+        let signed_token = token.sign_with_key(&issuer_priv)?;
         let signed_token_str = signed_token.as_str();
 
         let recreated_token: Token<Header, Claims, _> = Token::parse_unverified(signed_token_str)?;
@@ -485,7 +836,7 @@ mod tests {
             signed_token.issuer_jwt().claims(),
             recreated_token.issuer_jwt().claims()
         );
-        recreated_token.verify_with_key(&key)?;
+        recreated_token.verify_with_key(&issuer_pub)?;
         Ok(())
     }
 
@@ -499,7 +850,7 @@ mod tests {
         let mut array = array_original.clone();
         let array_disclosure = array.redact(array_ptr, &sd_alg)?;
         let redacted_element = array.as_array().unwrap()[1].as_object().unwrap();
-        assert!(redacted_element.contains_key(&REDACTION_FIELD.to_string()));
+        assert!(redacted_element.contains_key(&"...".to_string()));
         assert_eq!(redacted_element.len(), 1);
 
         array.unredact(array_disclosure, &sd_alg)?;
@@ -592,7 +943,14 @@ mod tests {
 
     #[test]
     pub fn round_trip_with_disclosures() -> Result<(), Error> {
+        let (issuer_priv, issuer_pub) = generate_key_pair();
         let sd_alg = HashAlgorithmType::Sha256;
+        let header = Header {
+            algorithm: issuer_priv.algorithm_type(),
+            key_id: None,
+            type_: None,
+            content_type: None,
+        };
 
         let claims = json!({
           "_sd_alg": "sha-256",
@@ -616,8 +974,7 @@ mod tests {
           ]
         });
 
-        let mut token: Token<Header, _, _> =
-            Token::new(Default::default(), claims.clone(), sd_alg)?;
+        let mut token: Token<Header, _, _> = Token::new(header, claims.clone(), sd_alg)?;
 
         token.redact("/given_name")?;
         token.redact("/family_name")?;
@@ -630,8 +987,7 @@ mod tests {
         token.redact("/nationalities/0")?;
         token.redact("/nationalities/1")?;
 
-        let key: Hmac<Sha256> = Hmac::new_from_slice(b"secret")?;
-        let signed_token = token.sign_with_key(&key)?;
+        let signed_token = token.sign_with_key(&issuer_priv)?;
         let signed_token_str = signed_token.as_str();
 
         let recreated_token: Token<Header, Value, _> = Token::parse_unverified(signed_token_str)?;
@@ -644,10 +1000,107 @@ mod tests {
             signed_token.issuer_jwt().claims(),
             recreated_token.issuer_jwt().claims()
         );
-        let verified_token = recreated_token.verify_with_key(&key)?;
+        let verified_token = recreated_token.verify_with_key(&issuer_pub)?;
 
         let claims_parsed: Value = verified_token.reveal()?;
         assert_eq!(claims_parsed, claims);
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn presentation_round_trip() -> Result<(), Error> {
+        let (issuer_priv, issuer_pub) = generate_key_pair();
+        let (kb_priv, kb_pub) = generate_key_pair();
+        let sd_alg = HashAlgorithmType::Sha256;
+        let header = Header {
+            algorithm: issuer_priv.algorithm_type(),
+            key_id: None,
+            type_: None,
+            content_type: None,
+        };
+
+        let claims = json!({
+          "email": "johndoe@example.com",
+          "address": {
+            "street_address": "123 Main St",
+            "locality": "Anytown",
+            "region": "Anystate",
+            "country": "US"
+          },
+          "nationalities": [
+            "US",
+            "DE"
+          ]
+        });
+
+        // Sign a token
+        let mut token: Token<Header, _, _> = Token::new(header, claims.clone(), sd_alg)?;
+        let cnf = kb_pub.jwk_thumbprint_confirmation();
+        token.set_confirmation_key(cnf)?;
+
+        token.redact("/email")?;
+        token.redact("/address/street_address")?;
+        token.redact("/nationalities/0")?;
+        token.redact("/nationalities/1")?;
+
+        let signed_token = token.sign_with_key(&issuer_priv)?;
+
+        // Sign and verify a presentation over the token, with full disclosure
+        {
+            let preso = Presentation::new(signed_token.clone(), "audience".to_string());
+            let signed_preso = preso.sign_with_key(&kb_priv)?;
+            let signed_preso_str = signed_preso.as_str();
+
+            let recreated_preso: Presentation<Header, Value, _> =
+                Presentation::parse_unverified(signed_preso_str)?;
+
+            let verified_preso = recreated_preso.verify_with_key(&kb_pub)?;
+            let signed_token = verified_preso.token();
+            let recreated_token = signed_token.as_unverified()?;
+            let verified_token = recreated_token.verify_with_key(&issuer_pub)?;
+
+            let _claims_parsed: Value = verified_token.reveal()?;
+        }
+
+        // Sign and verify a presentation over the token, with partial disclosure
+        {
+            let mut preso = Presentation::new(signed_token.clone(), "audience".to_string());
+            preso.forget("/address/street_address")?;
+            preso.forget("/nationalities/0")?;
+
+            let signed_preso = preso.sign_with_key(&kb_priv)?;
+            let signed_preso_str = signed_preso.as_str();
+
+            let recreated_preso: Presentation<Header, Value, _> =
+                Presentation::parse_unverified(signed_preso_str)?;
+
+            let verified_preso = recreated_preso.verify_with_key(&kb_pub)?;
+            let signed_token = verified_preso.token();
+            let recreated_token = signed_token.as_unverified()?;
+            let verified_token = recreated_token.verify_with_key(&issuer_pub)?;
+
+            let _claims_parsed: Value = verified_token.reveal()?;
+        }
+
+        // Sign and verify a presentation over the token, with no disclosure
+        {
+            let mut preso = Presentation::new(signed_token.clone(), "audience".to_string());
+            preso.forget_all()?;
+
+            let signed_preso = preso.sign_with_key(&kb_priv)?;
+            let signed_preso_str = signed_preso.as_str();
+
+            let recreated_preso: Presentation<Header, Value, _> =
+                Presentation::parse_unverified(signed_preso_str)?;
+
+            let verified_preso = recreated_preso.verify_with_key(&kb_pub)?;
+            let signed_token = verified_preso.token();
+            let recreated_token = signed_token.as_unverified()?;
+            let verified_token = recreated_token.verify_with_key(&issuer_pub)?;
+
+            let _claims_parsed: Value = verified_token.reveal()?;
+        }
 
         Ok(())
     }

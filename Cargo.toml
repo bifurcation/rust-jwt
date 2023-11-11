@@ -14,6 +14,10 @@ edition = "2018"
 [package.metadata.docs.rs]
 features = ["openssl"]
 
+[features]
+default = ["sd"] # TODO delete
+sd = ["openssl"] # selective disclosure requires asymmetric keys
+
 [dependencies]
 base64 = "0.13"
 crypto-common = "0.1"
