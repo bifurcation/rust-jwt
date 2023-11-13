@@ -28,7 +28,7 @@ pub trait JoseHeader {
 
 /// Generic [JWT header](https://tools.ietf.org/html/rfc7519#page-11) with
 /// defined fields for common fields.
-#[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Header {
     #[serde(rename = "alg")]
     pub algorithm: AlgorithmType,
@@ -62,10 +62,12 @@ impl JoseHeader for Header {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
 pub enum HeaderType {
     #[serde(rename = "JWT")]
     JsonWebToken,
+
+    #[serde(rename = "kb+jwt")]
+    KeyBindingJwt,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
